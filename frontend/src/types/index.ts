@@ -157,6 +157,7 @@ export interface InterviewStartData {
 export interface InterviewQuestionData {
   question_id: string;
   question_number: number;
+  reaction?: string;
   question_text: string;
   topic: string;
   difficulty: string;

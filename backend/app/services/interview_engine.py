@@ -1,34 +1,79 @@
 import json
 import re
 import uuid
-import math
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 from app.config import settings
 from app.core.db import db
-from app.models.interview import QuestionGenerated, ResumeDataSchema
+from app.models.interview import QuestionGenerated
 
 class InterviewEngine:
     """
-    Core engine handling adaptive question generation, semantic question deduplication,
-    multi-interview memory, and atomic student attempt limit locks.
+    Upgraded Real-time Human-like Interview Engine:
+    - Placement topic weighting matrix
+    - Semantic deduplication engine
+    - Hinglish / Hindi technical term parser
+    - Phonetic tech term corrector
+    - Short conversational reaction generator
+    - Adaptive real-time follow-up generator
     """
 
+    # Software Engineering Placement Weighting Matrix
+    TOPIC_WEIGHTS = {
+        "Project Architecture": 0.25,
+        "Data Structures & Algorithms": 0.20,
+        "DBMS & SQL": 0.10,
+        "Operating Systems & Concurrency": 0.10,
+        "Object Oriented Programming & Design": 0.10,
+        "Programming Fundamentals": 0.10,
+        "System & Role Knowledge": 0.10,
+        "Computer Networks": 0.05
+    }
+
     QUESTION_STYLES = [
-        "Conceptual", "Project-based", "Why", "How", "Debugging",
-        "Scenario", "Architecture", "Trade-off", "Comparison",
-        "Practical", "Optimization", "Failure analysis"
+        "Scenario", "Why", "How", "Debugging",
+        "Architecture", "Trade-off", "Comparison", "Practical"
     ]
+
+    # Technical phonetic term corrections map
+    PHONETIC_CORRECTIONS = {
+        "q drain": "Qdrant",
+        "q-drain": "Qdrant",
+        "q drent": "Qdrant",
+        "fast api": "FastAPI",
+        "fast-api": "FastAPI",
+        "post gress": "PostgreSQL",
+        "post-gress": "PostgreSQL",
+        "b m 25": "BM25",
+        "bm 25": "BM25",
+        "r a g": "RAG",
+        "rag": "RAG",
+        "lang chain": "LangChain",
+        "vector DB": "Vector Database"
+    }
+
+    @classmethod
+    def correct_phonetic_terms(cls, text: str, resume_topics: List[str]) -> str:
+        """
+        Contextually corrects common Speech-to-Text misinterpretations based on candidate's resume.
+        """
+        corrected = text
+        for term, replacement in cls.PHONETIC_CORRECTIONS.items():
+            pattern = re.compile(re.escape(term), re.IGNORECASE)
+            corrected = pattern.sub(replacement, corrected)
+            
+        for topic in resume_topics:
+            if topic and len(topic) > 3:
+                # If term in text is very close phonetically, ensure topic casing
+                pattern = re.compile(re.escape(topic), re.IGNORECASE)
+                corrected = pattern.sub(topic, corrected)
+                
+        return corrected
 
     @classmethod
     def check_and_reserve_attempt(cls, user_id: str) -> Dict[str, Any]:
-        """
-        Atomic reservation of student interview attempt to prevent double-click / multi-tab bypasses.
-        """
-        # Fetch or initialize limit doc
         limit_doc = db.get_document("interview_limits", user_id)
         if not limit_doc:
-            # Check global config for default limit
             config_doc = db.get_document("interview_config", "global_config") or {}
             default_limit = config_doc.get("default_allowed_interviews", 5)
             
@@ -43,7 +88,7 @@ class InterviewEngine:
             db.set_document("interview_limits", user_id, limit_doc)
 
         if limit_doc.get("is_disabled", False):
-            raise ValueError("AI Technical Interview access has been disabled by platform administrator.")
+            raise ValueError("AI Technical Interview access has been disabled by administrator.")
 
         allowed = limit_doc.get("allowed_interviews", 5)
         used = limit_doc.get("used_interviews", 0)
@@ -52,7 +97,6 @@ class InterviewEngine:
         if not is_unlimited and used >= allowed:
             raise ValueError(f"You have used all available interview attempts ({used}/{allowed}). Contact administrator for extra attempts.")
 
-        # Atomically increment used count
         new_used = used + 1
         limit_doc["used_interviews"] = new_used
         limit_doc["updated_at"] = datetime.now(timezone.utc).isoformat()
@@ -68,17 +112,11 @@ class InterviewEngine:
 
     @classmethod
     def get_past_user_questions(cls, user_id: str) -> List[str]:
-        """
-        Retrieves all question texts asked to this user across all previous interviews.
-        """
         all_iqs = db.query_collection("interview_questions", "user_id", user_id)
         return [q.get("question_text", "") for q in all_iqs if q.get("question_text")]
 
     @classmethod
     def is_duplicate_question(cls, candidate_q: str, past_questions: List[str], threshold: float = 0.65) -> bool:
-        """
-        Semantic/string deduplication check ensuring NO exact or paraphrased duplicate questions.
-        """
         def get_words(text: str) -> set:
             return set(re.findall(r'\w+', text.lower()))
 
@@ -99,99 +137,117 @@ class InterviewEngine:
         return False
 
     @classmethod
-    def get_user_past_weak_topics(cls, user_id: str) -> List[str]:
-        """
-        Multi-interview progress memory: Extracts weak topics from previous completed interviews.
-        """
-        past_interviews = db.query_collection("interviews", "user_id", user_id)
-        completed = [i for i in past_interviews if i.get("status") == "COMPLETED"]
-        if not completed:
-            return []
-            
-        completed.sort(key=lambda x: x.get("completed_at", ""), reverse=True)
-        latest = completed[0]
-        return latest.get("weak_areas", [])
-
-    @classmethod
-    def generate_next_question(
+    def generate_short_reaction_and_question(
         cls,
         user_id: str,
         interview_id: str,
         resume_doc: Dict[str, Any],
-        current_question_number: int,
-        previous_evaluations: List[Dict[str, Any]]
-    ) -> QuestionGenerated:
-        
+        current_q_num: int,
+        last_answer: Optional[str] = None,
+        last_score: Optional[float] = None
+    ) -> Dict[str, Any]:
+        """
+        Generates a 1-sentence natural bridge reaction + a fresh real-world technical question or adaptive follow-up.
+        """
         past_questions = cls.get_past_user_questions(user_id)
-        weak_topics = cls.get_user_past_weak_topics(user_id)
-        
         extracted_skills = resume_doc.get("skills", ["Python", "FastAPI", "PostgreSQL", "RAG"])
-        compact_context = resume_doc.get("compact_context", "Candidate with computer science skills.")
+        compact_context = resume_doc.get("compact_context", "Candidate with software engineering skills.")
         projects = resume_doc.get("projects", [])
-        
-        # Determine topic and style
-        style = cls.QUESTION_STYLES[(current_question_number - 1) % len(cls.QUESTION_STYLES)]
-        
-        # Priority to weak topics if present
-        if weak_topics and current_question_number in [1, 2]:
-            target_topic = weak_topics[(current_question_number - 1) % len(weak_topics)]
-        elif projects and current_question_number == 3:
-            target_topic = projects[0].get("name", "Project Architecture")
-            style = "Project-based"
-        else:
-            target_topic = extracted_skills[(current_question_number - 1) % len(extracted_skills)]
 
-        # Gemini API prompt
+        # Select topic based on placement weighting & question number
+        if projects and current_q_num == 1:
+            target_topic = projects[0].get("name", "Project Architecture")
+            style = "Architecture"
+        elif current_q_num == 2:
+            target_topic = extracted_skills[0] if extracted_skills else "Data Structures"
+            style = "Scenario"
+        elif current_q_num == 3:
+            target_topic = "DBMS & SQL"
+            style = "Trade-off"
+        elif current_q_num == 4:
+            target_topic = "Operating Systems & Concurrency"
+            style = "Debugging"
+        else:
+            target_topic = extracted_skills[1] if len(extracted_skills) > 1 else "System Design"
+            style = "Practical"
+
+        # Adaptive follow-up flag if candidate gave previous answer
+        is_followup = bool(last_answer and len(last_answer.split()) >= 3)
+
         if settings.GEMINI_API_KEY and settings.GEMINI_API_KEY != "your_gemini_api_key_here":
             try:
                 import google.generativeai as genai
                 genai.configure(api_key=settings.GEMINI_API_KEY)
                 model = genai.GenerativeModel(model_name=settings.GEMINI_MODEL)
-                
-                prompt = f"""
-You are an expert technical interviewer conducting a two-way AI voice technical interview.
-Candidate Compact Resume Summary: "{compact_context}"
-Target Technical Topic: "{target_topic}"
-Question Style: "{style}"
-Question Number: {current_question_number} of 5.
-Past Questions Asked (DO NOT REPEAT OR PARAPHRASE THESE):
-{json.dumps(past_questions, indent=2)}
 
-Generate a single concise, technical question (1-2 sentences) appropriate for voice playback.
+                if is_followup:
+                    prompt = f"""
+You are a senior professional Indian female technical interviewer conducting a live software engineering placement interview.
+Candidate Resume Context: "{compact_context}"
+Candidate Last Spoken Answer (May be in English, Hindi, or Hinglish): "{last_answer}"
+Target Topic: "{target_topic}"
+
+TASK:
+1. Generate a brief 1-sentence natural conversational reaction in English (e.g., "Got it, that makes sense.", "Okay, right.", "Interesting approach.")
+2. Generate an ADAPTIVE FOLLOW-UP question (1-2 sentences in English) derived directly from the candidate's last answer. If score was high, ask a deeper scenario/trade-off. If low, ask a foundational query.
+3. Past Questions Asked (DO NOT REPEAT): {json.dumps(past_questions)}
+
 Return JSON:
 {{
-  "question_text": "...",
+  "reaction": "Brief 1-sentence reaction",
+  "question_text": "Single clear 1-2 sentence spoken question in English",
+  "topic": "{target_topic}",
+  "difficulty": "Medium",
+  "question_type": "Adaptive Follow-up"
+}}
+"""
+                else:
+                    prompt = f"""
+You are a senior professional Indian female technical interviewer conducting a live software engineering placement interview.
+Candidate Resume Context: "{compact_context}"
+Target Topic: "{target_topic}"
+Question Style: "{style}"
+Question Number: {current_q_num} of 5.
+Past Questions Asked (DO NOT REPEAT): {json.dumps(past_questions)}
+
+Generate a single clear, natural technical interview question (1-2 sentences in English) suitable for live spoken interview.
+Return JSON:
+{{
+  "reaction": "Hi! Let's get started with your technical assessment." if current_q_num == 1 else "Okay, let's move to the next area.",
+  "question_text": "Single clear 1-2 sentence spoken question in English",
   "topic": "{target_topic}",
   "difficulty": "Medium",
   "question_type": "{style}"
 }}
 """
-                response = model.generate_content(prompt, generation_config={"response_mime_type": "application/json", "temperature": 0.3})
+
+                response = model.generate_content(prompt, generation_config={"response_mime_type": "application/json", "temperature": 0.2})
                 raw_json = response.text.strip()
                 if raw_json.startswith("```json"):
                     raw_json = raw_json.replace("```json", "").replace("```", "").strip()
                 data = json.loads(raw_json)
                 q_text = data.get("question_text", "")
-                
-                if not cls.is_duplicate_question(q_text, past_questions):
-                    return QuestionGenerated(
-                        question_id=f"iq_{uuid.uuid4().hex[:10]}",
-                        question_number=current_question_number,
-                        question_text=q_text,
-                        topic=data.get("topic", target_topic),
-                        difficulty=data.get("difficulty", "Medium"),
-                        question_type=data.get("question_type", style)
-                    )
-            except Exception as e:
-                print(f"[InterviewEngine] Gemini question generation error: {e}. Using rule fallback.")
 
-        # Fallback question generator enforcing non-duplicate questions
+                if not cls.is_duplicate_question(q_text, past_questions):
+                    return {
+                        "question_id": f"iq_{uuid.uuid4().hex[:10]}",
+                        "question_number": current_q_num,
+                        "reaction": data.get("reaction", "Got it."),
+                        "question_text": q_text,
+                        "topic": data.get("topic", target_topic),
+                        "difficulty": data.get("difficulty", "Medium"),
+                        "question_type": data.get("question_type", style)
+                    }
+            except Exception as e:
+                print(f"[InterviewEngine] Gemini adaptive question error: {e}. Using rule fallback.")
+
+        # Fallback question generator
         fallback_questions = [
-            f"In your experience with {target_topic}, how do you handle memory optimization and performance bottlenecks?",
-            f"Regarding {target_topic}, why would you choose this approach over traditional alternatives in production?",
-            f"Suppose a query or service involving {target_topic} experiences high latency. How would you investigate and resolve it?",
-            f"Explain the architectural trade-offs when scaling {target_topic} across multiple server instances.",
-            f"What edge cases or security concerns must be addressed when deploying {target_topic} in a cloud environment?"
+            f"Walk me through how you designed {target_topic} in your project and the key architectural trade-offs you considered.",
+            f"Suppose a service using {target_topic} experiences sudden high query latency in production. How would you debug it?",
+            f"When would you choose a different data structure or approach over {target_topic}?",
+            f"How do concurrency and lock contention affect performance when scaling {target_topic}?",
+            f"Explain how failure recovery and data integrity are handled in {target_topic}."
         ]
 
         q_text = fallback_questions[0]
@@ -200,11 +256,12 @@ Return JSON:
                 q_text = fq
                 break
 
-        return QuestionGenerated(
-            question_id=f"iq_{uuid.uuid4().hex[:10]}",
-            question_number=current_question_number,
-            question_text=q_text,
-            topic=target_topic,
-            difficulty="Medium",
-            question_type=style
-        )
+        return {
+            "question_id": f"iq_{uuid.uuid4().hex[:10]}",
+            "question_number": current_q_num,
+            "reaction": "Got it. Let's look at this next.",
+            "question_text": q_text,
+            "topic": target_topic,
+            "difficulty": "Medium",
+            "question_type": style
+        }

@@ -4,20 +4,16 @@ from typing import List, Dict, Any
 from fastapi import APIRouter, HTTPException, status, Depends
 from app.core.db import db
 from app.core.security import get_current_user
-from app.models.interview import (
-    InterviewStartResponse, QuestionGenerated, QuestionAnswerSubmit,
-    QuestionEvaluationResult, InterviewReport, StudyRecommendationItem
-)
+from app.models.interview import QuestionAnswerSubmit
 from app.services.interview_engine import InterviewEngine
 from app.services.interview_evaluator import InterviewEvaluator
 
-router = APIRouter(prefix="/interviews", tags=["AI Voice Interview"])
+router = APIRouter(prefix="/interviews", tags=["AI Voice Technical Interview"])
 
 @router.post("/start", response_model=dict)
 def start_interview(current_user: dict = Depends(get_current_user)):
     user_id = current_user["uid"]
-    
-    # 1. Fetch user's latest resume
+
     user_resumes = db.query_collection("resumes", "user_id", user_id)
     if not user_resumes:
         raise HTTPException(
@@ -27,16 +23,14 @@ def start_interview(current_user: dict = Depends(get_current_user)):
     user_resumes.sort(key=lambda x: x.get("created_at", ""), reverse=True)
     latest_resume = user_resumes[0]
 
-    # 2. Atomic Attempt Reservation Check Lock
     try:
         limit_info = InterviewEngine.check_and_reserve_attempt(user_id)
     except ValueError as err:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(err))
 
-    # 3. Create Interview Session
     interview_id = f"int_{uuid.uuid4().hex[:10]}"
     now_str = datetime.now(timezone.utc).isoformat()
-    
+
     interview_doc = {
         "id": interview_id,
         "user_id": user_id,
@@ -63,7 +57,7 @@ def get_next_question(id: str, current_user: dict = Depends(get_current_user)):
     interview = db.get_document("interviews", id)
     if not interview or interview.get("user_id") != current_user["uid"]:
         raise HTTPException(status_code=404, detail="Interview session not found.")
-        
+
     if interview.get("status") == "COMPLETED":
         raise HTTPException(status_code=400, detail="Interview session already completed.")
 
@@ -72,37 +66,41 @@ def get_next_question(id: str, current_user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=400, detail="All questions completed. Call /finish to generate report.")
 
     resume_doc = db.get_document("resumes", interview.get("resume_id")) or {}
-    
-    # Previous evaluations for this interview
+
     iqs = db.query_collection("interview_questions", "interview_id", id)
     iqs.sort(key=lambda x: x.get("question_number", 0))
 
-    generated = InterviewEngine.generate_next_question(
+    last_answer = iqs[-1].get("student_answer_raw", "") if iqs else None
+    last_score = iqs[-1].get("eval_score", None) if iqs else None
+
+    # Generate adaptive reaction + question payload
+    data = InterviewEngine.generate_short_reaction_and_question(
         user_id=current_user["uid"],
         interview_id=id,
         resume_doc=resume_doc,
-        current_question_number=current_q_num,
-        previous_evaluations=iqs
+        current_q_num=current_q_num,
+        last_answer=last_answer,
+        last_score=last_score
     )
 
-    # Store Question Record
     now_str = datetime.now(timezone.utc).isoformat()
     iq_doc = {
-        "id": generated.question_id,
+        "id": data["question_id"],
         "interview_id": id,
         "user_id": current_user["uid"],
-        "question_number": generated.question_number,
-        "question_text": generated.question_text,
-        "topic": generated.topic,
-        "difficulty": generated.difficulty,
-        "question_type": generated.question_type,
+        "question_number": data["question_number"],
+        "reaction": data["reaction"],
+        "question_text": data["question_text"],
+        "topic": data["topic"],
+        "difficulty": data["difficulty"],
+        "question_type": data["question_type"],
         "student_answer_raw": "",
         "eval_score": 0.0,
         "asked_at": now_str
     }
-    db.set_document("interview_questions", generated.question_id, iq_doc)
+    db.set_document("interview_questions", data["question_id"], iq_doc)
 
-    return generated.model_dump()
+    return data
 
 @router.post("/{id}/submit-answer", response_model=dict)
 def submit_interview_answer(
@@ -114,23 +112,32 @@ def submit_interview_answer(
     if not interview or interview.get("user_id") != current_user["uid"]:
         raise HTTPException(status_code=404, detail="Interview session not found.")
 
-    # Get latest active question
     iqs = db.query_collection("interview_questions", "interview_id", id)
     iqs.sort(key=lambda x: x.get("question_number", 0), reverse=True)
     if not iqs:
         raise HTTPException(status_code=400, detail="No active question found for this interview.")
-        
+
     latest_q = iqs[0]
-    
-    # Grade Answer via Structured Technical Evaluator
-    eval_result = InterviewEvaluator.evaluate_question_answer(
+    resume_doc = db.get_document("resumes", interview.get("resume_id")) or {}
+    resume_topics = resume_doc.get("skills", [])
+
+    # Phonetically correct technical terms in transcript
+    cleaned_answer = InterviewEngine.correct_phonetic_terms(payload.student_answer, resume_topics)
+
+    # Evaluate Answer (Hinglish/Hindi supported)
+    eval_res = InterviewEvaluator.evaluate_question_answer(
         question_text=latest_q["question_text"],
         topic=latest_q["topic"],
-        student_answer=payload.student_answer
+        student_answer=cleaned_answer
     )
-    eval_result.question_id = latest_q["id"]
 
-    # Store Evaluation Record
+    if eval_res.get("low_speech_confidence", False):
+        return {
+            "low_speech_confidence": True,
+            "feedback": eval_res["feedback"]
+        }
+
+    # Store Evaluation
     eval_id = f"ie_{uuid.uuid4().hex[:10]}"
     now_str = datetime.now(timezone.utc).isoformat()
     eval_doc = {
@@ -138,36 +145,34 @@ def submit_interview_answer(
         "question_id": latest_q["id"],
         "interview_id": id,
         "dimension_scores": {
-            "technical_correctness": eval_result.technical_correctness,
-            "concept_understanding": eval_result.concept_understanding,
-            "reasoning": eval_result.reasoning,
-            "completeness": eval_result.completeness,
-            "practical_understanding": eval_result.practical_understanding
+            "technical_correctness": eval_res["technical_correctness"],
+            "concept_understanding": eval_res["concept_understanding"],
+            "reasoning": eval_res["reasoning"],
+            "completeness": eval_res["completeness"],
+            "practical_understanding": eval_res["practical_understanding"]
         },
-        "missing_concepts": eval_result.missing_concepts,
-        "technical_feedback": eval_result.technical_feedback,
-        "question_score": eval_result.question_score,
+        "missing_concepts": eval_res["missing_concepts"],
+        "technical_feedback": eval_res["technical_feedback"],
+        "question_score": eval_res["question_score"],
         "evaluator_model": "gemini-1.5-flash",
-        "rubric_version": "v1.0",
         "evaluated_at": now_str
     }
     db.set_document("interview_evaluations", eval_id, eval_doc)
 
-    # Update Question Record with student answer and score
+    # Update Question Record
     db.update_document("interview_questions", latest_q["id"], {
-        "student_answer_raw": payload.student_answer,
-        "eval_score": eval_result.question_score,
+        "student_answer_raw": cleaned_answer,
+        "eval_score": eval_res["question_score"],
         "evaluation_id": eval_id
     })
 
-    # Increment completed questions count in session
     completed_q = interview.get("completed_questions", 0) + 1
     db.update_document("interviews", id, {"completed_questions": completed_q})
 
     return {
         "question_id": latest_q["id"],
-        "question_score": eval_result.question_score,
-        "evaluation": eval_result.model_dump()
+        "question_score": eval_res["question_score"],
+        "evaluation": eval_doc
     }
 
 @router.post("/{id}/finish", response_model=dict)
@@ -178,31 +183,29 @@ def finish_interview(id: str, current_user: dict = Depends(get_current_user)):
 
     iqs = db.query_collection("interview_questions", "interview_id", id)
     if not iqs:
-        raise HTTPException(status_code=400, detail="Cannot finish an empty interview session.")
+        raise HTTPException(status_code=400, detail="Cannot finish empty interview session.")
 
-    # Calculate Topic Scores and Overall Performance
     topic_scores = {}
     topic_counts = {}
     all_scores = []
-    
+
     for q in iqs:
         score = q.get("eval_score", 0.0)
         topic = q.get("topic", "General")
         all_scores.append(score)
-        
+
         topic_scores[topic] = topic_scores.get(topic, 0.0) + score
         topic_counts[topic] = topic_counts.get(topic, 0) + 1
 
     topic_averages = {t: round(topic_scores[t] / topic_counts[t], 1) for t in topic_scores}
     overall_score = round(sum(all_scores) / max(1, len(all_scores)), 1)
-    
+
     sorted_topics = sorted(topic_averages.items(), key=lambda x: x[1], reverse=True)
     strong_areas = [t[0] for t in sorted_topics if t[1] >= 70.0]
     weak_areas = [t[0] for t in sorted_topics if t[1] < 70.0]
     if not strong_areas and sorted_topics:
         strong_areas = [sorted_topics[0][0]]
 
-    # Generate Exact Study Recommendations
     recommendations = InterviewEvaluator.generate_exact_study_recommendations(topic_averages)
 
     now_str = datetime.now(timezone.utc).isoformat()
@@ -235,7 +238,6 @@ def get_interview_report(id: str, current_user: dict = Depends(get_current_user)
     iqs = db.query_collection("interview_questions", "interview_id", id)
     iqs.sort(key=lambda x: x.get("question_number", 0))
 
-    # User's score progression over past interviews
     user_interviews = db.query_collection("interviews", "user_id", interview.get("user_id"))
     completed_history = [
         {

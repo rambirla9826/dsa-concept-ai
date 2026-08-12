@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: algoconcept-backend
+    env: python
+    region: oregon
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PROJECT_NAME
+        value: AlgoConcept AI
+      - key: VERSION
+        value: 1.0.0
+      - key: JWT_SECRET
+        generateValue: true
+      - key: GEMINI_API_KEY
+        sync: false
